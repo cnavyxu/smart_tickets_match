@@ -214,8 +214,40 @@ SplitRule(
     tail_diff_type=TailDiffType.AMOUNT,  # 尾差类型（AMOUNT/PERCENTAGE/UNLIMITED）
     tail_diff_value=50_000,              # 尾差值
     split_strategy=SplitStrategy.BY_AMOUNT, # 拆票策略（BY_AMOUNT/BY_TERM/BY_ACCEPTOR）
+    split_sub_strategy=AmountSubStrategy.CLOSE_ABOVE_BIAS, # 拆票子策略（仅当split_strategy为BY_AMOUNT时使用）
 )
 ```
+
+#### 拆票规则说明
+
+**拆分类型（tail_diff_type）**：
+- `AMOUNT`：尾差金额，tail_diff_value 为绝对金额
+- `PERCENTAGE`：尾差占付款单金额占比，tail_diff_value 为占比（如 0.05 表示 5%）
+- `UNLIMITED`：无限制，允许任意尾差
+
+**拆分逻辑**：
+- 计算 `bias_amount = 付款单金额 - 当前票据总金额`
+- 如果 `bias_amount > 0`（票据总额不足）：
+  - 当 `bias_amount < tail_diff` 时，不拆票，使用电汇尾差
+  - 当 `bias_amount >= tail_diff` 时，从票据池中选择一张新票进行拆分
+- 如果 `bias_amount < 0`（票据总额超出）：
+  - 从当前票据组合中选择一张票据进行拆分
+
+**拆票策略（split_strategy）**：
+- `BY_TERM`：按票据到期期限选择（根据 term_strategy 配置）
+- `BY_ACCEPTOR`：按票据承兑人分类选择（根据 acceptor_strategy 配置）
+- `BY_AMOUNT`：按票据金额选择，可配合子策略使用
+
+**拆票金额子策略（split_sub_strategy）**：仅当 split_strategy 为 BY_AMOUNT 时使用
+- `BIG_TO_SMALL`：大额优先
+- `SMALL_TO_BIG`：小额优先
+- `CLOSE_ABOVE_BIAS`：接近但大于差额（默认）
+- `RANDOM`：随机选择
+
+**拆票约束**：
+- `remain_after_split`：票据拆分后留存金额阈值
+- 拆分后留存金额必须 >= remain_after_split
+- 如果某张票据不满足留存要求，会尝试选择下一张票据进行拆分
 
 ### 用户偏好
 

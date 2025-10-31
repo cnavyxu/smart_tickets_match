@@ -9,7 +9,7 @@ from decimal import Decimal, ROUND_HALF_UP, getcontext
 import math
 import random
 import time
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .data_structures import (
     AcceptorStrategy,
@@ -329,29 +329,32 @@ class OptimizedTicketMatcher:
             return
 
         bias_amount = self.payment_order.amount - self._current_total_amount()
-        if abs(bias_amount) <= self.tail_threshold:
-            return
 
         if bias_amount > 0:
+            if self.tail_threshold.is_infinite() or bias_amount < self.tail_threshold:
+                return
             self._split_from_pool(bias_amount)
-        else:
+        elif bias_amount < 0:
             self._split_from_current(-bias_amount)
 
     def _split_from_pool(self, bias_amount: Decimal) -> None:
-        """从未选票据中拆分出差额"""
+        """从未选票据中拆分出差额，根据拆票策略选择票据"""
 
-        sorted_candidates = sorted(
-            [c for c in self._unused_candidates if c.ticket.amount > bias_amount],
-            key=lambda c: (c.ticket.amount - bias_amount, -c.total_score),
-        )
+        if len(self._selected) >= self.constraints.max_tickets:
+            return
 
-        for candidate in sorted_candidates:
-            if len(self._selected) >= self.constraints.max_tickets:
-                break
+        eligible_candidates = [c for c in self._unused_candidates if c.ticket.amount > bias_amount]
+        if not eligible_candidates:
+            return
+
+        sorted_candidates = self._sort_candidates_by_split_strategy(eligible_candidates, bias_amount)
+        attempted_ids: Set[str] = set()
+
+        def try_use_candidate(candidate: CandidateTicket) -> bool:
             ticket = candidate.ticket
             remain = ticket.amount - bias_amount
             if remain < self.constraints.remain_after_split:
-                continue
+                return False
 
             used_amount = quantize_decimal(bias_amount)
             remain_amount = quantize_decimal(remain)
@@ -371,27 +374,192 @@ class OptimizedTicketMatcher:
                 )
             )
             self._unused_candidates.remove(candidate)
+            return True
+
+        for candidate in sorted_candidates:
+            if candidate.ticket.id in attempted_ids:
+                continue
+            attempted_ids.add(candidate.ticket.id)
+            if try_use_candidate(candidate):
+                return
+
+        need_fallback = self.split_rule.split_strategy != SplitStrategy.BY_AMOUNT
+        if self.split_rule.split_strategy == SplitStrategy.BY_AMOUNT:
+            need_fallback = self.split_rule.split_sub_strategy in (
+                AmountSubStrategy.BIG_TO_SMALL,
+                AmountSubStrategy.SMALL_TO_BIG,
+                AmountSubStrategy.RANDOM,
+            )
+
+        if not need_fallback:
             return
 
-    def _split_from_current(self, excess_amount: Decimal) -> None:
-        """对当前选票进行拆分，减少超额金额"""
-
-        sorted_selected = sorted(
-            [s for s in self._selected if s.used_amount > excess_amount],
-            key=lambda s: (s.used_amount - excess_amount, -s.scores[-1]),
+        fallback_candidates = sorted(
+            eligible_candidates,
+            key=lambda c: (c.ticket.amount - bias_amount, -c.total_score),
         )
+        for candidate in fallback_candidates:
+            if candidate.ticket.id in attempted_ids:
+                continue
+            attempted_ids.add(candidate.ticket.id)
+            if try_use_candidate(candidate):
+                return
 
-        for selected in sorted_selected:
+    def _split_from_current(self, excess_amount: Decimal) -> None:
+        """对当前选票进行拆分，减少超额金额，根据拆票策略选择票据"""
+
+        eligible_selected = [s for s in self._selected if s.used_amount > excess_amount]
+        if not eligible_selected:
+            return
+
+        sorted_selected = self._sort_selected_by_split_strategy(eligible_selected, excess_amount)
+        attempted_ids: Set[str] = set()
+
+        def try_split_selected(selected: SelectedTicket) -> bool:
             remain = selected.used_amount - excess_amount
             if remain < self.constraints.remain_after_split:
-                continue
+                return False
 
             selected.used_amount = quantize_decimal(remain)
             selected.remain_amount = quantize_decimal(
                 selected.ticket.amount - selected.used_amount
             )
             selected.is_split = True
+            return True
+
+        for selected in sorted_selected:
+            if selected.ticket.id in attempted_ids:
+                continue
+            attempted_ids.add(selected.ticket.id)
+            if try_split_selected(selected):
+                return
+
+        need_fallback = self.split_rule.split_strategy != SplitStrategy.BY_AMOUNT
+        if self.split_rule.split_strategy == SplitStrategy.BY_AMOUNT:
+            need_fallback = self.split_rule.split_sub_strategy in (
+                AmountSubStrategy.BIG_TO_SMALL,
+                AmountSubStrategy.SMALL_TO_BIG,
+                AmountSubStrategy.RANDOM,
+            )
+
+        if not need_fallback:
             return
+
+        fallback_selected = sorted(
+            eligible_selected,
+            key=lambda s: (s.used_amount - excess_amount, -s.scores[-1]),
+        )
+        for selected in fallback_selected:
+            if selected.ticket.id in attempted_ids:
+                continue
+            attempted_ids.add(selected.ticket.id)
+            if try_split_selected(selected):
+                return
+
+
+    def _sort_candidates_by_split_strategy(
+        self, candidates: List[CandidateTicket], bias_amount: Decimal
+    ) -> List[CandidateTicket]:
+        """根据拆票策略对候选票据进行排序"""
+        strategy = self.split_rule.split_strategy
+
+        if strategy == SplitStrategy.BY_TERM:
+            if self.target_weights.term_strategy == TermStrategy.FAR_FIRST:
+                return sorted(
+                    candidates,
+                    key=lambda c: (-c.ticket.days_to_expire, c.ticket.amount - bias_amount, -c.total_score),
+                )
+            else:
+                return sorted(
+                    candidates,
+                    key=lambda c: (c.ticket.days_to_expire, c.ticket.amount - bias_amount, -c.total_score),
+                )
+        elif strategy == SplitStrategy.BY_ACCEPTOR:
+            if self.target_weights.acceptor_strategy == AcceptorStrategy.GOOD_FIRST:
+                return sorted(
+                    candidates,
+                    key=lambda c: (c.ticket.acceptor_score, c.ticket.amount - bias_amount, -c.total_score),
+                )
+            else:
+                return sorted(
+                    candidates,
+                    key=lambda c: (-c.ticket.acceptor_score, c.ticket.amount - bias_amount, -c.total_score),
+                )
+        elif strategy == SplitStrategy.BY_AMOUNT:
+            sub_strategy = self.split_rule.split_sub_strategy
+            if sub_strategy == AmountSubStrategy.BIG_TO_SMALL:
+                return sorted(
+                    candidates,
+                    key=lambda c: (-c.ticket.amount, c.ticket.amount - bias_amount, -c.total_score),
+                )
+            elif sub_strategy == AmountSubStrategy.SMALL_TO_BIG:
+                return sorted(
+                    candidates,
+                    key=lambda c: (c.ticket.amount, c.ticket.amount - bias_amount, -c.total_score),
+                )
+            elif sub_strategy == AmountSubStrategy.RANDOM:
+                shuffled = list(candidates)
+                self.random.shuffle(shuffled)
+                return shuffled
+            else:
+                return sorted(
+                    candidates,
+                    key=lambda c: (c.ticket.amount - bias_amount, -c.total_score),
+                )
+        else:
+            return sorted(candidates, key=lambda c: (c.ticket.amount - bias_amount, -c.total_score))
+
+    def _sort_selected_by_split_strategy(
+        self, selected_tickets: List[SelectedTicket], excess_amount: Decimal
+    ) -> List[SelectedTicket]:
+        """根据拆票策略对已选票据进行排序"""
+        strategy = self.split_rule.split_strategy
+
+        if strategy == SplitStrategy.BY_TERM:
+            if self.target_weights.term_strategy == TermStrategy.FAR_FIRST:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (-s.ticket.days_to_expire, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+            else:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (s.ticket.days_to_expire, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+        elif strategy == SplitStrategy.BY_ACCEPTOR:
+            if self.target_weights.acceptor_strategy == AcceptorStrategy.GOOD_FIRST:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (s.ticket.acceptor_score, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+            else:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (-s.ticket.acceptor_score, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+        elif strategy == SplitStrategy.BY_AMOUNT:
+            sub_strategy = self.split_rule.split_sub_strategy
+            if sub_strategy == AmountSubStrategy.BIG_TO_SMALL:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (-s.used_amount, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+            elif sub_strategy == AmountSubStrategy.SMALL_TO_BIG:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (s.used_amount, s.used_amount - excess_amount, -s.scores[-1]),
+                )
+            elif sub_strategy == AmountSubStrategy.RANDOM:
+                shuffled = list(selected_tickets)
+                self.random.shuffle(shuffled)
+                return shuffled
+            else:
+                return sorted(
+                    selected_tickets,
+                    key=lambda s: (s.used_amount - excess_amount, -s.scores[-1]),
+                )
+        else:
+            return sorted(selected_tickets, key=lambda s: (s.used_amount - excess_amount, -s.scores[-1]))
 
     def _swap_optimization(self) -> None:
         """尝试通过交换提升得分或减少尾差"""
