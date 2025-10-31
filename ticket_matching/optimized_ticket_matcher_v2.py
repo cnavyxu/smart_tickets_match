@@ -156,6 +156,20 @@ class OptimizedTicketMatcher:
         candidates = self._build_candidates()
         filtered_candidates = self._fast_prefilter(candidates)
 
+        # 如果优先匹配等额票，先检查是否有等额票
+        if self.user_preference.prefer_exact:
+            exact_match = self._find_exact_match_ticket(filtered_candidates)
+            if exact_match:
+                # 找到等额票，直接使用
+                self._selected = [exact_match]
+                selected_ids = {exact_match.ticket.id}
+                self._unused_candidates = [
+                    candidate for candidate in filtered_candidates if candidate.ticket.id not in selected_ids
+                ]
+                solution = self._create_solution()
+                solution.execution_time = time.perf_counter() - start_time
+                return solution
+
         self._selected = self._improved_greedy_construct(filtered_candidates)
         selected_ids = {selected.ticket.id for selected in self._selected}
         self._unused_candidates = [
@@ -220,6 +234,32 @@ class OptimizedTicketMatcher:
                 continue
             filtered.append(candidate)
         return filtered
+
+    def _find_exact_match_ticket(self, candidates: List[CandidateTicket]) -> Optional[SelectedTicket]:
+        """在候选列表中找到金额等于付款单金额的最佳票据"""
+
+        target_amount = quantize_decimal(self.payment_order.amount)
+        exact_candidates = [
+            candidate
+            for candidate in candidates
+            if quantize_decimal(candidate.ticket.amount) == target_amount
+        ]
+        if not exact_candidates:
+            return None
+        best_candidate = max(exact_candidates, key=lambda c: c.total_score)
+        return SelectedTicket(
+            ticket=best_candidate.ticket,
+            used_amount=quantize_decimal(best_candidate.ticket.amount),
+            remain_amount=Decimal("0"),
+            is_split=False,
+            scores=(
+                best_candidate.amount_score,
+                best_candidate.term_score,
+                best_candidate.acceptor_score,
+                best_candidate.organization_score,
+                best_candidate.total_score,
+            ),
+        )
 
     # ---------- 阶段二：改进贪心构建 ----------
 
@@ -532,7 +572,7 @@ class OptimizedTicketMatcher:
             (ticket.ticket.amount - ticket.used_amount)
             for ticket in self._selected
             if ticket.is_split
-        )
+        ) or Decimal("0")
 
         amount_score, term_score, acceptor_score, organization_score = 0.0, 0.0, 0.0, 0.0
         if self._selected:
