@@ -10,7 +10,8 @@
 
 - ✅ **多维度优化**：支持金额、期限、承兑人、组织四个维度的权重配置
 - ✅ **多种金额策略**：大额优先、小额优先、接近目标金额、库存优化等
-- ✅ **智能拆票**：当无法精确匹配时自动拆分票据
+- ✅ **强制穿透**：可开启最高权重维度强制穿透，严格执行优先级
+- ✅ **智能拆票**：当无法精确匹配时自动拆分票据，并支持拆票比例与最小金额约束
 - ✅ **库存平衡**：考虑库存结构，优化剩余票据分布
 - ✅ **约束保障**：支持张数限制、金额上下限、极小票限制等多种约束
 - ✅ **高效求解**：三阶段混合策略，秒级完成优化
@@ -167,6 +168,7 @@ class TargetWeights:
     w4: float                                # 组织权重
     amount_strategy: AmountStrategy          # 金额策略
     term_strategy: TermStrategy              # 期限策略
+    term_threshold: Optional[int] = None     # 期限阈值（可选）
     acceptor_strategy: AcceptorStrategy      # 承兑人策略
     organization_strategy: OrganizationStrategy  # 组织策略
 ```
@@ -211,10 +213,13 @@ Constraints(
 
 ```python
 SplitRule(
-    tail_diff_type=TailDiffType.AMOUNT,  # 尾差类型（AMOUNT/PERCENTAGE/UNLIMITED）
-    tail_diff_value=50_000,              # 尾差值
-    split_strategy=SplitStrategy.BY_AMOUNT, # 拆票策略（BY_AMOUNT/BY_TERM/BY_ACCEPTOR）
+    tail_diff_type=TailDiffType.AMOUNT,                  # 尾差类型（AMOUNT/PERCENTAGE/UNLIMITED）
+    tail_diff_value=50_000,                              # 尾差值
+    split_strategy=SplitStrategy.BY_AMOUNT,              # 拆票策略（BY_AMOUNT/BY_TERM/BY_ACCEPTOR）
     split_sub_strategy=AmountSubStrategy.CLOSE_ABOVE_BIAS, # 拆票子策略（仅当split_strategy为BY_AMOUNT时使用）
+    split_condition_type=SplitConditionType.UNLIMITED,   # 拆票条件类型（新增）
+    split_min_used_amount=Decimal("50000"),              # 拆分使用金额最小值（新增，默认5万元）
+    split_min_ratio=Decimal("0.3"),                      # 拆分金额占比最小值（新增，默认30%）
 )
 ```
 
@@ -225,13 +230,18 @@ SplitRule(
 - `PERCENTAGE`：尾差占付款单金额占比，tail_diff_value 为占比（如 0.05 表示 5%）
 - `UNLIMITED`：无限制，允许任意尾差
 
-**拆分逻辑**：
-- 计算 `bias_amount = 付款单金额 - 当前票据总金额`
-- 如果 `bias_amount > 0`（票据总额不足）：
-  - 当 `bias_amount < tail_diff` 时，不拆票，使用电汇尾差
-  - 当 `bias_amount >= tail_diff` 时，从票据池中选择一张新票进行拆分
-- 如果 `bias_amount < 0`（票据总额超出）：
-  - 从当前票据组合中选择一张票据进行拆分
+**拆票条件类型（split_condition_type）**：
+- `UNLIMITED`：差额不受尾差限制，按拆票策略正常拆分
+- `WITHIN_TAIL_DIFF`：当 `0 < bias_amount <= tail_diff` 时不拆票，改为使用电汇补齐尾差
+
+**拆票逻辑**：
+1. 计算 `bias_amount = 付款单金额 - 当前票据总金额`
+2. 根据 `split_condition_type` 判断是否需要拆票：
+   - 若为 `WITHIN_TAIL_DIFF` 且 `bias_amount` 在尾差范围内，则直接使用电汇补齐
+   - 其他情况进入拆票流程
+3. 拆票流程：
+   - 若 `bias_amount > 0`（票据总额不足）：从候选票据池中挑选一张票拆出差额
+   - 若 `bias_amount < 0`（票据总额超额）：从当前组合中选择一张票据拆分
 
 **拆票策略（split_strategy）**：
 - `BY_TERM`：按票据到期期限选择（根据 term_strategy 配置）
@@ -244,10 +254,10 @@ SplitRule(
 - `CLOSE_ABOVE_BIAS`：接近但大于差额（默认）
 - `RANDOM`：随机选择
 
-**拆票约束**：
-- `remain_after_split`：票据拆分后留存金额阈值
-- 拆分后留存金额必须 >= remain_after_split
-- 如果某张票据不满足留存要求，会尝试选择下一张票据进行拆分
+**拆票约束（新增）**：
+- `split_min_used_amount`：拆分使用金额必须 ≥ 该阈值（默认 50,000 元）
+- `remain_after_split`：拆分后留存金额必须 ≥ 该阈值（默认 50,000 元）
+- `split_min_ratio`：拆分后实际使用金额必须占原始票据金额 ≥ 该比例（默认 30%）
 
 ### 用户偏好
 
@@ -256,6 +266,7 @@ UserPreference(
     prefer_exact=False,                  # 是否优先匹配等额票
     allow_split=True,                    # 是否允许拆票
     allow_inventory_balance=True,        # 是否考虑库存平衡
+    force_top_weight_dimension=False,    # 最高权重维度是否强制穿透
     remain_dist={                        # 期望剩余库存占比
         "大额": 0.4,
         "中额": 0.4,
@@ -263,6 +274,14 @@ UserPreference(
     },
 )
 ```
+
+**参数说明**：
+- `prefer_exact`：当为 True 时，如果找到金额完全等于付款单金额的票据，直接使用该票据
+- `allow_split`：是否允许拆分票据
+- `allow_inventory_balance`：是否考虑库存平衡优化
+- `force_top_weight_dimension`：（新增）当为 True 时，根据最高权重维度（w1/w2/w3/w4 中最大者）对候选票据进行强制排序，不允许跨级用票
+- `remain_dist`：期望剩余库存占比，仅当 allow_inventory_balance 为 True 时生效
+
 
 ## 输出说明
 
@@ -317,7 +336,7 @@ result_dict = solution.to_dict()
 └── ticket_matching/                        # 核心代码包
     ├── __init__.py                         # 包初始化
     ├── data_structures.py                  # 数据结构定义
-    └── optimized_ticket_matcher_v2.py      # 核心算法实现
+    └── optimized_ticket_matcher.py         # 核心算法实现
 ```
 
 ## 技术栈

@@ -13,6 +13,7 @@ from .data_structures import (
     PaymentOrder,
     Solution,
     SplitRule,
+    SplitConditionType,
     SplitStrategy,
     TailDiffType,
     TargetWeights,
@@ -22,7 +23,7 @@ from .data_structures import (
     TicketUsageDetail,
     UserPreference,
 )
-from .optimized_ticket_matcher_v2 import OptimizedTicketMatcher, generate_test_data, run_example
+from .optimized_ticket_matcher import OptimizedTicketMatcher, generate_test_data, run_example
 
 __all__ = [
     "AcceptorStrategy",
@@ -35,6 +36,7 @@ __all__ = [
     "PaymentOrder",
     "Solution",
     "SplitRule",
+    "SplitConditionType",
     "SplitStrategy",
     "TailDiffType",
     "TargetWeights",
