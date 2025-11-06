@@ -58,6 +58,12 @@ class TailDiffType(Enum):
     AMOUNT = "amount"  # 尾差金额
 
 
+class SplitConditionType(Enum):
+    """拆票条件类型"""
+    UNLIMITED = "unlimited"  # 无限制
+    WITHIN_TAIL_DIFF = "within_tail_diff"  # 差额范围内无需拆分（走电汇尾差补齐）
+
+
 class TicketCategory(Enum):
     """票据分类"""
     BIG = "big"  # 大票
@@ -94,6 +100,7 @@ class TargetWeights:
     amount_strategy: AmountStrategy  # 金额策略
     amount_sub_strategy: Optional[AmountSubStrategy] = None  # 金额子策略
     term_strategy: TermStrategy = TermStrategy.FAR_FIRST  # 期限策略
+    term_threshold: Optional[int] = None  # 期限阈值（优先远/优先近时生效）
     acceptor_strategy: AcceptorStrategy = AcceptorStrategy.GOOD_FIRST  # 承兑人策略
     organization_strategy: OrganizationStrategy = OrganizationStrategy.SAME_ORG_FIRST  # 组织策略
 
@@ -102,6 +109,8 @@ class TargetWeights:
         total = self.w1 + self.w2 + self.w3 + self.w4
         if not (0.99 <= total <= 1.01):  # 允许浮点误差
             raise ValueError(f"权重和必须为1，当前为{total}")
+        if self.term_threshold is not None and self.term_threshold < 0:
+            raise ValueError("term_threshold 不能为负数")
 
 
 @dataclass
@@ -111,6 +120,17 @@ class SplitRule:
     tail_diff_value: float  # 尾差值
     split_strategy: SplitStrategy  # 拆票策略
     split_sub_strategy: Optional[AmountSubStrategy] = None  # 拆票子策略（仅当split_strategy为BY_AMOUNT时使用）
+    split_condition_type: SplitConditionType = SplitConditionType.UNLIMITED  # 拆票条件类型（无限制/差额范围内无需拆分）
+    split_min_used_amount: Decimal = Decimal("50000")  # 拆分使用金额（差额）最小值（默认5万）
+    split_min_ratio: Decimal = Decimal("0.3")  # 拆分金额占整张票据比例最小值（默认30%）
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.split_min_used_amount, Decimal):
+            self.split_min_used_amount = Decimal(str(self.split_min_used_amount))
+        if not isinstance(self.split_min_ratio, Decimal):
+            self.split_min_ratio = Decimal(str(self.split_min_ratio))
+        if self.split_min_ratio <= 0 or self.split_min_ratio > 1:
+            raise ValueError("split_min_ratio 必须位于(0, 1]区间")
 
 
 @dataclass
@@ -160,6 +180,7 @@ class UserPreference:
     prefer_exact: bool = False  # 是否优先匹配等额票
     allow_split: bool = True  # 是否允许拆分票据
     allow_inventory_balance: bool = False  # 是否考虑库存平衡
+    force_top_weight_dimension: bool = False  # 最高权重维度是否强制穿透
     amount_dist: Optional[Dict[str, List[Decimal]]] = None  # 金额区间划分 {"大额": [min, max], "小额": [min, max]}
     remain_dist: Optional[Dict[str, float]] = None  # 期望剩余票据占比 {"大额": 0.5, "中额": 0.3, "小额": 0.2}
 

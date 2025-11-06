@@ -21,6 +21,7 @@ from .data_structures import (
     PaymentOrder,
     Solution,
     SplitRule,
+    SplitConditionType,
     SplitStrategy,
     TailDiffType,
     TargetWeights,
@@ -155,6 +156,7 @@ class OptimizedTicketMatcher:
 
         candidates = self._build_candidates()
         filtered_candidates = self._fast_prefilter(candidates)
+        filtered_candidates = self._apply_force_preference(filtered_candidates)
 
         # 如果优先匹配等额票，先检查是否有等额票
         if self.user_preference.prefer_exact:
@@ -166,6 +168,7 @@ class OptimizedTicketMatcher:
                 self._unused_candidates = [
                     candidate for candidate in filtered_candidates if candidate.ticket.id not in selected_ids
                 ]
+                self._unused_candidates = self._apply_force_preference(self._unused_candidates)
                 solution = self._create_solution()
                 solution.execution_time = time.perf_counter() - start_time
                 return solution
@@ -175,6 +178,7 @@ class OptimizedTicketMatcher:
         self._unused_candidates = [
             candidate for candidate in filtered_candidates if candidate.ticket.id not in selected_ids
         ]
+        self._unused_candidates = self._apply_force_preference(self._unused_candidates)
 
         self._optimize_split()
         self._swap_optimization()
@@ -234,6 +238,113 @@ class OptimizedTicketMatcher:
                 continue
             filtered.append(candidate)
         return filtered
+
+    def _apply_force_preference(self, candidates: List[CandidateTicket]) -> List[CandidateTicket]:
+        """应用最高权重维度强制穿透逻辑"""
+        ordered = list(candidates)
+        if not self.user_preference.force_top_weight_dimension:
+            return ordered
+
+        weights = {
+            "w1": self.target_weights.w1,
+            "w2": self.target_weights.w2,
+            "w3": self.target_weights.w3,
+            "w4": self.target_weights.w4,
+        }
+        max_weight_key = max(weights, key=weights.get)
+
+        if max_weight_key == "w1":
+            return self._apply_amount_force_preference(ordered)
+        if max_weight_key == "w2":
+            return self._apply_term_force_preference(ordered)
+        if max_weight_key == "w3":
+            return self._apply_acceptor_force_preference(ordered)
+        if max_weight_key == "w4":
+            return self._apply_organization_force_preference(ordered)
+
+        return ordered
+
+    def _apply_amount_force_preference(self, candidates: List[CandidateTicket]) -> List[CandidateTicket]:
+        """应用金额维度强制穿透"""
+        strategy = self.target_weights.amount_strategy
+        if strategy == AmountStrategy.BIG_FIRST:
+            return sorted(candidates, key=lambda c: (-c.ticket.amount, -c.total_score))
+        if strategy == AmountStrategy.SMALL_FIRST:
+            return sorted(candidates, key=lambda c: (c.ticket.amount, -c.total_score))
+        if strategy == AmountStrategy.CLOSE_BELOW:
+            target_amount = self.payment_order.amount
+            return sorted(
+                candidates,
+                key=lambda c: (
+                    c.ticket.amount > target_amount,
+                    abs(c.ticket.amount - target_amount),
+                    -c.total_score,
+                ),
+            )
+        if strategy == AmountStrategy.CLOSE_ABOVE:
+            target_amount = self.payment_order.amount
+            return sorted(
+                candidates,
+                key=lambda c: (
+                    c.ticket.amount < target_amount,
+                    abs(c.ticket.amount - target_amount),
+                    -c.total_score,
+                ),
+            )
+        if strategy == AmountStrategy.OPTIMIZE_INVENTORY:
+            weights = self._inventory_priority_weights()
+            base_order = [TicketCategory.BIG, TicketCategory.MIDDLE, TicketCategory.SMALL]
+            return sorted(
+                candidates,
+                key=lambda c: (
+                    -weights.get(c.ticket.category or TicketCategory.MIDDLE, 0.0),
+                    -c.total_score,
+                ),
+            )
+        return candidates
+
+    def _apply_term_force_preference(self, candidates: List[CandidateTicket]) -> List[CandidateTicket]:
+        """应用期限维度强制穿透"""
+        strategy = self.target_weights.term_strategy
+        threshold = self.target_weights.term_threshold
+        if threshold is not None:
+            if strategy == TermStrategy.FAR_FIRST:
+                return sorted(
+                    candidates,
+                    key=lambda c: (
+                        c.ticket.days_to_expire < threshold,
+                        -c.ticket.days_to_expire,
+                        -c.total_score,
+                    ),
+                )
+            return sorted(
+                candidates,
+                key=lambda c: (
+                    c.ticket.days_to_expire > threshold,
+                    c.ticket.days_to_expire,
+                    -c.total_score,
+                ),
+            )
+        if strategy == TermStrategy.FAR_FIRST:
+            return sorted(candidates, key=lambda c: (-c.ticket.days_to_expire, -c.total_score))
+        return sorted(candidates, key=lambda c: (c.ticket.days_to_expire, -c.total_score))
+
+    def _apply_acceptor_force_preference(self, candidates: List[CandidateTicket]) -> List[CandidateTicket]:
+        """应用承兑人维度强制穿透"""
+        strategy = self.target_weights.acceptor_strategy
+        if strategy == AcceptorStrategy.GOOD_FIRST:
+            return sorted(candidates, key=lambda c: (c.ticket.acceptor_score, -c.total_score))
+        else:
+            return sorted(candidates, key=lambda c: (-c.ticket.acceptor_score, -c.total_score))
+
+    def _apply_organization_force_preference(self, candidates: List[CandidateTicket]) -> List[CandidateTicket]:
+        """应用组织维度强制穿透"""
+        strategy = self.target_weights.organization_strategy
+        pay_org = self.payment_order.organization
+        if strategy == OrganizationStrategy.SAME_ORG_FIRST:
+            return sorted(candidates, key=lambda c: (c.ticket.organization != pay_org, -c.total_score))
+        else:
+            return sorted(candidates, key=lambda c: (c.ticket.organization == pay_org, -c.total_score))
 
     def _find_exact_match_ticket(self, candidates: List[CandidateTicket]) -> Optional[SelectedTicket]:
         """在候选列表中找到金额等于付款单金额的最佳票据"""
@@ -331,11 +442,19 @@ class OptimizedTicketMatcher:
         bias_amount = self.payment_order.amount - self._current_total_amount()
 
         if bias_amount > 0:
-            if self.tail_threshold.is_infinite() or bias_amount < self.tail_threshold:
+            if (
+                self.split_rule.split_condition_type == SplitConditionType.WITHIN_TAIL_DIFF
+                and self._is_within_tail_diff(bias_amount)
+            ):
+                return
+            if bias_amount < self.split_rule.split_min_used_amount:
                 return
             self._split_from_pool(bias_amount)
         elif bias_amount < 0:
-            self._split_from_current(-bias_amount)
+            excess_amount = -bias_amount
+            if excess_amount < self.split_rule.split_min_used_amount:
+                return
+            self._split_from_current(excess_amount)
 
     def _split_from_pool(self, bias_amount: Decimal) -> None:
         """从未选票据中拆分出差额，根据拆票策略选择票据"""
@@ -354,6 +473,16 @@ class OptimizedTicketMatcher:
             ticket = candidate.ticket
             remain = ticket.amount - bias_amount
             if remain < self.constraints.remain_after_split:
+                return False
+
+            if bias_amount < self.constraints.min_amount:
+                return False
+            if bias_amount > self.constraints.max_amount:
+                return False
+
+            # 检查拆分比例约束
+            used_ratio = bias_amount / ticket.amount
+            if used_ratio < self.split_rule.split_min_ratio:
                 return False
 
             used_amount = quantize_decimal(bias_amount)
@@ -416,14 +545,25 @@ class OptimizedTicketMatcher:
         attempted_ids: Set[str] = set()
 
         def try_split_selected(selected: SelectedTicket) -> bool:
-            remain = selected.used_amount - excess_amount
-            if remain < self.constraints.remain_after_split:
+            original_amount = selected.ticket.amount
+            new_used = selected.used_amount - excess_amount
+            if new_used <= 0:
+                return False
+            if new_used < self.constraints.min_amount:
+                return False
+            if new_used > self.constraints.max_amount:
                 return False
 
-            selected.used_amount = quantize_decimal(remain)
-            selected.remain_amount = quantize_decimal(
-                selected.ticket.amount - selected.used_amount
-            )
+            leftover = original_amount - new_used
+            if 0 < leftover < self.constraints.remain_after_split:
+                return False
+
+            used_ratio = new_used / original_amount
+            if used_ratio < self.split_rule.split_min_ratio:
+                return False
+
+            selected.used_amount = quantize_decimal(new_used)
+            selected.remain_amount = quantize_decimal(leftover)
             selected.is_split = True
             return True
 
@@ -574,7 +714,12 @@ class OptimizedTicketMatcher:
         improvement_threshold = 1.001  # 至少提升0.1%
         for _ in range(10):  # 限制迭代次数，避免过长
             swap_made = False
-            for candidate in sorted(self._unused_candidates, key=lambda c: c.total_score, reverse=True):
+            if self.user_preference.force_top_weight_dimension:
+                candidate_order = self._apply_force_preference(self._unused_candidates)
+            else:
+                candidate_order = sorted(self._unused_candidates, key=lambda c: c.total_score, reverse=True)
+
+            for candidate in candidate_order:
                 for selected in sorted(self._selected, key=lambda s: s.scores[-1]):
                     new_total = current_total - selected.used_amount + candidate.ticket.amount
                     new_bias = abs(target_amount - new_total)
@@ -614,6 +759,7 @@ class OptimizedTicketMatcher:
                             is_mini_amount=selected.ticket.amount < self.constraints.min_amount * 2,
                         )
                     )
+                    self._unused_candidates = self._apply_force_preference(self._unused_candidates)
                     current_total = new_total
                     current_bias = abs(target_amount - current_total)
                     swap_made = True
@@ -704,11 +850,41 @@ class OptimizedTicketMatcher:
 
     def _compute_term_scores(self, tickets: List[Ticket]) -> Dict[str, float]:
         days = [ticket.days_to_expire for ticket in tickets]
+        if not days:
+            return {}
+
+        threshold = self.target_weights.term_threshold
+        strategy = self.target_weights.term_strategy
+
+        if threshold is not None:
+            scores: Dict[str, float] = {}
+            if strategy == TermStrategy.FAR_FIRST:
+                threshold_value = max(threshold, 1)
+                for ticket in tickets:
+                    if ticket.days_to_expire >= threshold:
+                        score = 1.0
+                    else:
+                        score = ticket.days_to_expire / threshold_value
+                    scores[ticket.id] = clamp(score)
+            else:
+                max_days = max(days)
+                if max_days <= threshold:
+                    for ticket in tickets:
+                        scores[ticket.id] = 1.0
+                else:
+                    denominator = max(max_days - threshold, 1)
+                    for ticket in tickets:
+                        if ticket.days_to_expire <= threshold:
+                            score = 1.0
+                        else:
+                            score = 1 - (ticket.days_to_expire - threshold) / denominator
+                        scores[ticket.id] = clamp(score)
+            return scores
+
         normalized_days = normalize(days)
-        if self.target_weights.term_strategy == TermStrategy.FAR_FIRST:
+        if strategy == TermStrategy.FAR_FIRST:
             return {ticket.id: score for ticket, score in zip(tickets, normalized_days)}
-        else:
-            return {ticket.id: score for ticket, score in zip(tickets, normalize_desc(days))}
+        return {ticket.id: score for ticket, score in zip(tickets, normalize_desc(days))}
 
     def _compute_acceptor_scores(self, tickets: List[Ticket]) -> Dict[str, float]:
         scores = [ticket.acceptor_score for ticket in tickets]
@@ -800,6 +976,12 @@ class OptimizedTicketMatcher:
             return quantize_decimal(self.payment_order.amount * Decimal(str(self.split_rule.tail_diff_value)))
         else:
             return quantize_decimal(Decimal(str(self.split_rule.tail_diff_value)))
+
+    def _is_within_tail_diff(self, bias_amount: Decimal) -> bool:
+        """判断差额是否在尾差范围内"""
+        if self.tail_threshold.is_infinite():
+            return False
+        return bias_amount <= self.tail_threshold
 
     def _current_total_amount(self) -> Decimal:
         return sum(ticket.used_amount for ticket in self._selected)
